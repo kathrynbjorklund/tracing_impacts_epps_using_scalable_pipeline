@@ -1,0 +1,61 @@
+# 17) Share of resolved event locations by species and continent
+
+library(readxl)   
+library(dplyr)   
+library(ggplot2)  
+library(scales)  # display proportions as percentages
+
+input_xlsx <- "events_by_species_continent_data.xlsx"
+output_pdf <- "events_by_species_continent_stacked.pdf"
+
+df <- read_excel(input_xlsx, sheet = "event_counts")
+
+# Set the order of the continents in the bars and legend
+continent_levels <- c("Africa", "Asia", "Europe", "North America", "Americas",
+                      "South America", "Oceania", "Antarctica")
+
+continent_colors <- c(
+  "Africa"        = "#D55E00",
+  "Asia"          = "#E69F00",
+  "Europe"        = "#CC79A7",
+  "North America" = "#009E73",
+  "Americas"      = "#999999",
+  "South America" = "#0072B2",
+  "Oceania"       = "#56B4E9",
+  "Antarctica"    = "#000000"
+)
+
+# Set the species order from top to bottom
+species_top_to_bottom <- c("dengue", "ebola", "zika", "desert locust",
+                           "fall armyworm", "screwworm")
+
+# Calculate each continent's share of the total for its species
+df <- df %>%
+  mutate(
+    continent = factor(continent, levels = continent_levels),
+    species = factor(species, levels = rev(species_top_to_bottom))
+  ) %>%
+  group_by(species) %>%
+  mutate(proportion = n / sum(n)) %>%
+  ungroup()
+
+# Draw one stacked percentage bar for each species
+p <- ggplot(df, aes(x = proportion, y = species, fill = continent)) +
+  geom_col(width = 0.7, color = "white", linewidth = 0.3,
+           position = position_stack(reverse = TRUE)) +  # match the stack order to the legend
+  scale_x_continuous(labels = percent_format(accuracy = 1), expand = c(0, 0)) +
+  scale_fill_manual(values = continent_colors, breaks = continent_levels, name = NULL) +
+  labs(x = "Proportion of resolved event locations", y = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.y = element_blank(),       
+    panel.grid.minor = element_blank(),         
+    panel.grid.major.x = element_line(color = "grey90", linewidth = 0.3),
+    axis.text.y = element_text(size = 11, face = "italic"),
+    legend.position = "bottom",              
+    legend.key.size = grid::unit(0.4, "cm"),
+    plot.margin = margin(t = 10, r = 20, b = 10, l = 10)
+  ) +
+  guides(fill = guide_legend(nrow = 1))        
+
+ggsave(output_pdf, p, width = 8, height = 4.5, units = "in")
