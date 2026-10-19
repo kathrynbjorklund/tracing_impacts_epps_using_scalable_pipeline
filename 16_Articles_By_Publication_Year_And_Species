@@ -1,0 +1,232 @@
+# 16) Number of articles by publication year and species
+
+  library(readxl)     
+  library(dplyr)      
+  library(tidyr)      
+  library(ggplot2)    
+  library(scales)  # format axis numbers
+  library(patchwork)  # combine plots
+
+input_xlsx <- "article_plot_data.xlsx"
+
+article_counts <- read_excel(
+  input_xlsx, sheet = "article_counts",
+  col_types = "numeric", na = c("", "NA"), progress = FALSE
+)
+
+highlight_events <- read_excel(
+  input_xlsx, sheet = "highlight_events",
+  col_types = c("text", "text", "numeric", "numeric", "logical"),
+  na = c("", "NA"), progress = FALSE
+) %>%
+  mutate(
+    event_label = paste0( # create each shaded band's legend label.
+      species, ": ", event, " (", start_year, "-", end_year, ")"
+    ),
+    event_label = factor(event_label, levels = unique(event_label)),
+    xmin = start_year, # left edge of the shaded band
+    xmax = end_year # right edge of the shaded band
+  )
+
+# Choose the species groups and appearance
+human_species <- c("Dengue", "Ebola", "Zika")
+crop_livestock_species <- c("Desert locust", "Fall armyworm", "Screwworm")
+species_levels <- c(human_species, crop_livestock_species)
+
+species_colors <- c(
+  "Dengue" = "#0072B2", "Ebola" = "#D55E00", "Zika" = "#009E73",
+  "Desert locust" = "#E69F00", "Fall armyworm" = "#117733",
+  "Screwworm" = "#CC79A7"
+)
+
+species_shapes <- c(
+  "Dengue" = 21, "Ebola" = 22, "Zika" = 24,
+  "Desert locust" = 21, "Fall armyworm" = 22, "Screwworm" = 24
+)
+
+event_colors <- setNames(
+  unname(species_colors[highlight_events$species]),
+  as.character(highlight_events$event_label)
+)
+
+band_alpha <- 0.18  # shading strength
+y_limits <- c(1, 4000)  # use the same vertical range in both panels
+log_breaks <- c(1, 3, 10, 30, 100, 300, 1000, 3000)
+last_year <- max(article_counts$publication_year, na.rm = TRUE)
+
+# Make one row per species and year, keeping available counts
+observed_counts <- article_counts %>%
+  pivot_longer(
+    cols = all_of(species_levels),
+    names_to = "species", values_to = "articles"
+  ) %>%
+  filter(!is.na(articles)) %>%
+  mutate(species = factor(species, levels = species_levels)) %>%
+  group_by(species) %>%
+  mutate(
+    final_year = max(publication_year),  # last available year for this species
+    penultimate_year = sort(publication_year, decreasing = TRUE)[2]
+  ) %>%
+  ungroup()
+
+# Separate the final year from earlier years
+terminal_points <- observed_counts %>%
+  filter(publication_year == final_year)  # open symbols for the final year
+
+regular_points <- observed_counts %>%
+  filter(publication_year < final_year)  # filled symbols for earlier years
+
+solid_lines <- observed_counts %>%
+  filter(publication_year <= penultimate_year)  # solid lines before the final year
+
+dashed_lines <- observed_counts %>%
+  filter(publication_year >= penultimate_year)  # dashed line to the final year
+
+# Define how to draw one panel
+build_articles_plot <- function(selected_species, year_break_interval) {
+
+  keep <- function(data) {  # keep only the species in this panel
+    data %>%
+      filter(species %in% selected_species) %>%
+      mutate(species = droplevels(species))
+  }
+
+  panel_counts <- keep(observed_counts)
+  panel_species <- levels(panel_counts$species)
+  first_year <- min(panel_counts$publication_year)
+
+  panel_events <- highlight_events %>%
+    filter(species %in% selected_species) %>%
+    mutate(event_label = droplevels(event_label))
+
+  band_edges <- data.frame(
+    edge = c(panel_events$xmin, panel_events$xmax)
+  )
+
+  bracket_data <- panel_events %>%
+    filter(bracket) %>%  # add brackets only where the Excel sheet says TRUE
+    mutate(
+      y = 10^(log10(y_limits[2]) - 0.015),  # place the bracket near the top
+      y_tick = 10^(log10(y) - 0.085),  # set the length of its end marks
+      bar_color = unname(species_colors[species])
+    )
+
+  regular_panel_points <- keep(regular_points)
+  regular_point_fill <- unname(
+    species_colors[as.character(regular_panel_points$species)]
+  )
+
+  species_guide <- guide_legend(
+    order = 1,
+    override.aes = list(  # show the correct shapes and colors in the legend
+      linetype = 0, size = 3,
+      shape = unname(species_shapes[panel_species]),
+      fill = unname(species_colors[panel_species])
+    )
+  )
+
+  ggplot() +
+    geom_rect(  # draw shaded event windows behind the data
+      data = panel_events,
+      aes(xmin = xmin, xmax = xmax, ymin = y_limits[1],
+          ymax = y_limits[2], fill = event_label),
+      alpha = band_alpha
+    ) +
+    geom_vline(  # mark the start and end of each shaded window
+      data = band_edges, aes(xintercept = edge),
+      color = "grey35", linetype = "dotted", linewidth = 0.35
+    ) +
+    scale_fill_manual(
+      values = event_colors, name = NULL,
+      guide = guide_legend(
+        position = "bottom", order = 2, ncol = 1,
+        override.aes = list(alpha = 0.45)
+      )
+    ) +
+    geom_line(  # join the earlier years with solid lines
+      data = keep(solid_lines),
+      aes(x = publication_year, y = articles, color = species),
+      linewidth = 0.8, na.rm = TRUE
+    ) +
+    geom_line(  # make the final segment dashed
+      data = keep(dashed_lines),
+      aes(x = publication_year, y = articles, color = species),
+      linewidth = 0.8, linetype = "dashed"
+    ) +
+    geom_point(  # use filled symbols for earlier years
+      data = regular_panel_points,
+      aes(x = publication_year, y = articles, color = species, shape = species),
+      fill = regular_point_fill, size = 2.3, stroke = 0.8
+    ) +
+    geom_point(  # use open symbols for the final year
+      data = keep(terminal_points),
+      aes(x = publication_year, y = articles, color = species, shape = species),
+      size = 2.9, stroke = 1, fill = "white", show.legend = FALSE
+    ) +
+    geom_segment(  # draw the top of each bracket
+      data = bracket_data,
+      aes(x = xmin, xend = xmax, y = y, yend = y),
+      color = bracket_data$bar_color, linewidth = 0.8
+    ) +
+    geom_segment(  # draw the left end of each bracket
+      data = bracket_data,
+      aes(x = xmin, xend = xmin, y = y, yend = y_tick),
+      color = bracket_data$bar_color, linewidth = 0.8
+    ) +
+    geom_segment(  # draw the right end of each bracket
+      data = bracket_data,
+      aes(x = xmax, xend = xmax, y = y, yend = y_tick),
+      color = bracket_data$bar_color, linewidth = 0.8
+    ) +
+    scale_color_manual(values = species_colors, guide = species_guide) +
+    scale_shape_manual(values = species_shapes, guide = "none") +
+    scale_x_continuous(  # set the year labels and horizontal range
+      breaks = seq(first_year, last_year, by = year_break_interval),
+      minor_breaks = NULL, limits = c(first_year, last_year + 0.5),
+      expand = expansion(mult = c(0.02, 0.02))
+    ) +
+    scale_y_log10(  # keep the original logarithmic vertical scale
+      breaks = log_breaks, labels = label_comma(),
+      limits = y_limits, expand = expansion(mult = c(0.02, 0.03))
+    ) +
+    labs(x = "Publication year", y = "Number of articles",
+         color = NULL, shape = NULL) +
+    theme_classic(base_size = 12) +
+    theme(  # keep the original legend, text, and spacing settings
+      legend.position = "top",
+      legend.box = "vertical",
+      legend.box.just = "left",
+      legend.spacing.y = grid::unit(2, "pt"),
+      legend.margin = margin(t = 4, b = 4),
+      legend.text = element_text(face = "bold", size = 12),
+      legend.key.width = grid::unit(1.6, "lines"),
+      axis.title.x = element_text(face = "bold", size = 14, margin = margin(t = 18)),
+      axis.title.y = element_text(face = "bold", size = 14, margin = margin(r = 16)),
+      axis.text.x = element_text(
+        face = "bold", size = 10.5, angle = 45,
+        hjust = 1, margin = margin(t = 7)
+      ),
+      axis.text.y = element_text(face = "bold", size = 10.5, margin = margin(r = 5)),
+      axis.ticks = element_line(linewidth = 0.5),
+      plot.margin = margin(t = 15, r = 20, b = 20, l = 20)
+    )
+}
+
+# Draw the two panels
+human_panel <- build_articles_plot(human_species, year_break_interval = 2)
+crop_livestock_panel <- build_articles_plot(
+  crop_livestock_species, year_break_interval = 1
+)
+
+# Place the panels side by side and add (a) and (b)
+articles_by_year_plot <- (
+  (human_panel | crop_livestock_panel) +
+    plot_layout(axis_titles = "collect") +
+    plot_annotation(tag_levels = "a", tag_prefix = "(", tag_suffix = ")")
+) &
+  theme(
+    plot.tag = element_text(face = "bold", size = 15),
+    plot.tag.position = c(0.01, 1)
+  )
+
+print(articles_by_year_plot)  
