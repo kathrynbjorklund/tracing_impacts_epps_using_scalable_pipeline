@@ -1,0 +1,143 @@
+# 15) Assigning continents to extracted event locations (find continent or country then continent)
+	# Then assigning continents to whole articles
+
+library(dplyr) # filter, combine, and summarize tables
+library(readr) # write results as CSV files
+library(readxl)  
+library(stringr) # split, clean, and search text
+library(tidyr) # turn lists of locations into separate rows
+library(countrycode) # recognize countries and find their continents
+
+input_xlsx <- "EventsTimesLocations.xlsx"  
+output_dir <- "./outputs"              
+dir.create(output_dir, showWarnings = FALSE)  
+
+articles <- read_excel(input_xlsx, sheet = "Sheet1", col_types = "text") %>%  
+  mutate(article_id = row_number())  # give each row an ID
+
+mentions <- articles %>%
+  mutate(location = str_split(`Event Location`, "\\s*\\|\\s*")) %>%  # split locations at each |
+  select(article_id, species, location) %>%  # keep just these three columns
+  unnest_longer(location) %>% # make one row per location slot
+  mutate(location = str_trim(location)) %>%  # remove spaces at the start and end
+  filter(!is.na(location), location != "", str_to_upper(location) != "NA")  # drop missing or blank locations
+
+locations <- mentions %>%
+  count(location, sort = TRUE, name = "n_mentions")  # count repeat locations; keep one row per distinct location text
+
+# 1) Look for continent words
+# \\b marks a word boundary and | means "or".
+continent_patterns <- c(
+  "Africa"     = "\\bafrica\\b", # Africa
+  "Asia"       = "\\basia\\b|\\bmiddle east\\b", # Asia or Middle East
+  "Europe"     = "\\beurope\\b", # Europe
+  "Oceania"    = "\\boceania\\b|\\baustralasia\\b|\\bpacific islands?\\b", # Oceania and related region names
+  "Americas"   = "\\bamericas\\b|\\b(north|south|central|latin)[\\s-]+america\\b|\\bcaribbean\\b",  # Americas and named subregions.
+  "Antarctica" = "\\bantarctica\\b" # Antarctica
+)
+
+match_continent <- function(x) { # check one location against all continent patterns
+  hits <- names(continent_patterns)[  # keep the names of the matching continent categories
+    vapply(continent_patterns,
+           function(p) str_detect(x, regex(p, ignore_case = TRUE)), logical(1))  # test each pattern, ignoring capitals
+  ]
+  if (length(hits) == 1) hits else NA_character_  # return one match; otherwise return a missing value
+}
+
+# Recognized countries (e.g., South Africa) are left for the country step
+is_country <- !is.na(countryname(locations$location, warn = FALSE))
+
+locations$continent_keyword <- NA_character_  # start with an empty continent column
+locations$continent_keyword[!is_country] <-
+  vapply(locations$location[!is_country], match_continent, character(1))  # check the remaining locations
+
+# 2) Recognize country names
+locations$country_matched <- NA_character_  # start with an empty country column
+needs_country <- is.na(locations$continent_keyword)  # select locations without a continent-word match
+locations$country_matched[needs_country] <-
+  countryname(locations$location[needs_country], warn = FALSE)  # convert recognized country names to standard names
+
+# 3) Find each matched country's continent 
+locations <- locations %>%
+  mutate(country = country_matched,  # use the country found by the country-name matcher
+         continent = coalesce(continent_keyword, # prefer a continent already found by keyword
+                              countrycode(country, "country.name", "continent", warn = FALSE))) # otherwise find the country's continent
+
+# 4) Split the Americas into North and South where possible 
+region_int <- countrycode(locations$country, "country.name", "un.regionintermediate.name", warn = FALSE)  # get country groups such as Caribbean and South America
+region_sub <- countrycode(locations$country, "country.name", "un.regionsub.name", warn = FALSE)  # get broader groups such as Northern America
+
+locations <- locations %>%
+  mutate(continent = case_when( # apply the first matching rule below
+    continent != "Americas" | is.na(continent) ~ continent,  # keep other continents and missing values as they are
+    region_int == "South America" ~ "South America",  # label country South America
+    region_int %in% c("Central America", "Caribbean") ~ "North America",  # label Central America and Caribbean as North America
+    region_sub == "Northern America" ~ "North America",  # label Northern America as North America
+    str_detect(str_to_lower(location), "south[\\s-]+american?s?\\b") ~ "South America",  # label South American as South America
+    str_detect(str_to_lower(location), "(north|central)[\\s-]+american?s?\\b|\\bcaribbean\\b") ~ "North America",  # label Northern, Central, or Caribbean wording as North America 
+    TRUE ~ "Americas"  # keep the broader label if neither side can be chosen
+  ))
+
+# Record which method supplied a result 
+locations <- locations %>%
+  mutate(resolved_by = case_when(
+    !is.na(continent_keyword) ~ "tier1_keyword",  # a continent-word match was found
+    !is.na(country_matched)   ~ "tier2_country",  # a country-name match was found
+    TRUE                     ~ "unresolved"))   # neither method recognized the location
+
+resolution <- locations %>%
+  count(resolved_by, wt = n_mentions, name = "mentions") %>%  # count mentions per method, including repeated location text
+  mutate(pct = round(100 * mentions / sum(mentions), 1)) %>%  # calculate each method's percentage to one decimal place
+  arrange(desc(mentions))  # put the largest count first
+
+write_csv(resolution, file.path(output_dir, "resolution_report.csv"))  # save the mention counts and percentages by method
+write_csv(locations, file.path(output_dir, "location_lookup.csv"))  # save a key of distinct og text locations, how many times they each appeared, continent keyword, country matched, country, final continent assigned, which of the methods found the continent
+
+# Add the result to each location mention 
+events_with_continent <- mentions %>%
+  left_join(locations %>% select(location, continent, resolved_by), by = "location")  # add each mention's continent and method
+
+write_csv(events_with_continent, file.path(output_dir, "events_with_continent.csv"))  # save the mention-level results
+
+# Rebuild the continent list for each article
+continent_of <- setNames(locations$continent, locations$location)  # make a lookup from each location text to its continent
+
+format_continents <- function(cell) {  # convert one article's location list to a continent list
+  if (is.na(cell)) return(NA_character_)  # leave a missing cell missing
+  slots <- str_trim(str_split(cell, "\\s*\\|\\s*")[[1]])  # split at | and trim surrounding spaces
+  out <- vapply(slots, function(s) {  # look up each location in its original order
+    if (s == "" || str_to_upper(s) == "NA") return("NA")  # keep a placeholder for an empty location
+    hit <- unname(continent_of[s])  # retrieve the continent for this location
+    if (is.na(hit)) "NA" else hit  # use NA text if no continent was found
+  }, character(1))  # expect one text result per location
+  paste(out, collapse = " | ")  # join the results back into one cell
+}
+
+# Choose each article's most frequent continent 
+overall_continent <- function(cell) {  # find the most frequent label in one article's continent list
+  if (is.na(cell)) return(NA_character_)  # leave a missing list unassigned
+  slots <- str_trim(str_split(cell, "\\s*\\|\\s*")[[1]])  # split the list into separate labels
+  slots <- slots[slots != "" & str_to_upper(slots) != "NA"]  # remove blank and missing labels
+  if (!length(slots)) return(NA_character_)  # stop if no known continent remains
+  tab <- sort(table(slots), decreasing = TRUE)  # count labels and put the most frequent first
+  names(tab)[1]  # return the single most frequent label
+}
+
+articles$`Event Continent` <- vapply(articles$`Event Location`, format_continents, character(1))  # add a continent column to every article
+articles$`Overall Continent` <- vapply(articles$`Event Continent`, overall_continent, character(1))  # add each article's most frequent continent
+
+write_csv(articles, file.path(output_dir, "articles_with_continent.csv"))  # save the original article table with the new columns
+
+# Count location mentions and articles by species and continent 
+events_by_continent <- events_with_continent %>%
+  filter(!is.na(continent)) %>%  # exclude mentions without a continent
+  count(species, continent, sort = TRUE) # count mentions for each species and continent
+
+write_csv(events_by_continent, file.path(output_dir, "events_by_species_continent.csv")) # save the mention counts
+
+articles_by_continent <- articles %>%
+  filter(!is.na(`Overall Continent`)) %>%  # exclude articles without an assigned continent
+  count(species, `Overall Continent`, sort = TRUE) %>%  # count article rows for each species and continent
+  rename(continent = `Overall Continent`) # rename summary column 
+
+write_csv(articles_by_continent, file.path(output_dir, "articles_by_species_continent.csv"))  # save the article counts
