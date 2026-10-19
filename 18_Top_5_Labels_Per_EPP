@@ -1,0 +1,268 @@
+#  18) Top 5 labels per EPP
+
+library(stopwords)
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(tibble)
+library(readr)
+
+infile <- “CropSubgroups.xlsx"
+sheet  <- "Sheet1"
+outdir <- "output/top5_by_epp"
+
+top_n  <- 5
+
+# Stopwords for crop EPPs
+custom_stopwords <- c(
+  "locust", "outbreak", "swarm", "invasion", "invasive", "pest", "infestation", 
+  "plague","insect", "armyworm", "worm", "faw", "fall armyworm", "fall", "species", "agricultural"
+)
+protected_phrases <- character(0)
+# protected_phrases <- c("sterile insect technique", "integrated pest management")
+
+# Stopwords for human EPPS
+# custom_stopwords <- c( 
+#  "ebola", "dengue", "zika", "zikv", "infectious", "outbreak", "disease",
+#  "end", "surge", "worm", "marburg", "case", "vector-borne"
+# )
+
+variants <- c("none", "english", "custom")
+
+stopword_source  <- "snowball"   # "snowball" | "nltk" | "smart" | "stopwords-iso"
+keep_words       <- c("no", "not", "nor", "against", "without")  # negations rescued
+on_all_stopwords <- "drop"       # "drop" | "keep" | "head"
+min_word_chars   <- 2
+
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+if (!grepl("UTF-8|utf8", Sys.getlocale("LC_CTYPE"), ignore.case = TRUE)) {
+  for (loc in c("en_US.UTF-8", "C.UTF-8", "C.utf8")) {
+    got <- suppressWarnings(try(Sys.setlocale("LC_CTYPE", loc), silent = TRUE))
+    if (!inherits(got, "try-error") && nzchar(got)) break
+  }
+}
+
+# English stopwords
+if (requireNamespace("stopwords", quietly = TRUE)) {
+  english_stopwords <- stopwords::stopwords("en", source = stopword_source)
+  stopword_origin   <- paste0("stopwords::stopwords(en, ", stopword_source, ")")
+} else {
+  suppressPackageStartupMessages(library(tidytext))
+  data("stop_words", package = "tidytext")
+  english_stopwords <- unique(stop_words$word[stop_words$lexicon == "snowball"])
+  stopword_origin   <- "tidytext::stop_words (snowball)"
+  warning("Package `stopwords` not found; used tidytext's snowball lexicon instead.")
+}
+
+# Singular/plural normalization 
+irregular <- c(people = "person", children = "child", women = "woman", men = "man",
+               mice = "mouse", lice = "louse", feet = "foot", geese = "goose",
+               larvae = "larva", nymphae = "nympha", crises = "crisis",
+               analyses = "analysis", theses = "thesis")
+invariant <- c("species", "series", "means", "news", "data", "media", "aphis",
+               "myiasis", "access", "press", "progress", "status", "virus", "census",
+               "genomics", "genetics", "economics", "logistics", "statistics",
+               "politics", "diagnostics", "informatics", "robotics", "ethics",
+               "physics", "mathematics", "dynamics", "mechanics", "linguistics",
+               "semantics", "analytics", "indoors", "outdoors", "overseas",
+               "headquarters", "premises", "goods", "savings", "earnings",
+               "proceedings", "surroundings")
+
+singular_candidates <- function(w) {
+  if (w %in% names(irregular)) return(unname(irregular[w]))
+  if (w %in% invariant)        return(character(0))
+  if (!str_detect(w, "s$"))    return(character(0))
+  if (str_detect(w, "(ss|us|is|as|os)$")) return(character(0))
+  out <- character(0)
+  if (str_detect(w, "ies$") && nchar(w) > 4)
+    out <- c(out, str_replace(w, "ies$", "y"))
+  if (str_detect(w, "(s|x|z|ch|sh)es$"))
+    out <- c(out, str_sub(w, 1, -3))
+  if (str_detect(w, "ves$") && nchar(w) > 4)
+    out <- c(out, str_replace(w, "ves$", "f"), str_replace(w, "ves$", "fe"))
+  c(out, str_sub(w, 1, -2))
+}
+
+build_plural_map <- function(vocab) {
+  m <- character(0)
+  for (w in vocab) {
+    cand <- singular_candidates(w)
+    cand <- cand[cand %in% vocab & cand != w]
+    if (!length(cand)) next
+    m[w] <- cand[which.max(nchar(cand))] 
+  }
+  for (w in names(m)) {                    # resolve chains a -> b -> c
+    seen <- w; target <- m[[w]]
+    while (!is.na(m[target]) && !(target %in% seen)) {
+      seen <- c(seen, target); target <- m[[target]]
+    }
+    m[w] <- target
+  }
+  m
+}
+
+TOKEN_RX <- "[a-z]+(?:'[a-z]+)?"
+words_of <- function(x) {
+  w <- unlist(str_extract_all(str_to_lower(x), TOKEN_RX))
+  w[nchar(w) >= min_word_chars]
+}
+
+# Read, assign EPP, split labels
+raw <- read_excel(infile, sheet = sheet, col_types = "text")
+
+loc_pat <- regex("desert[ -]?locusts?|schistocerca[ -]?gregaria", ignore_case = TRUE)
+scr_pat <- regex("screw[ -]?worms?|cochliomyia[ -]?hominivorax", ignore_case = TRUE)
+
+dat <- raw %>%
+  mutate(feed_title_clean = str_squish(replace_na(feed_title, ""))) %>%
+  mutate(EPP = case_when(
+    str_detect(feed_title_clean, loc_pat) ~ "Desert locust",
+    str_detect(feed_title_clean, scr_pat) ~ "Screwworm",
+    feed_title_clean == ""                ~ "Fall armyworm",
+    TRUE                                  ~ "Unassigned"))
+
+long <- dat %>%
+  transmute(EPP,
+            article_title    = item_title,
+            domain,
+            publication_date = as.character(`publication.date`),
+            subgroup         = as.character(Subgroups),
+            .row = row_number()) %>%
+  separate_rows(subgroup, sep = "\\s*\\|\\s*") %>%
+  mutate(subgroup = str_trim(subgroup)) %>%
+  filter(!is.na(subgroup), nzchar(subgroup)) %>%
+  group_by(.row) %>% mutate(subgroup_id = row_number()) %>% ungroup()
+
+vocab <- unique(words_of(long$subgroup))
+pmap  <- build_plural_map(vocab)
+
+normalize_label <- function(s) {
+  s <- str_squish(str_to_lower(s))
+  vapply(str_split(s, " "), function(parts)
+    paste(ifelse(parts %in% names(pmap), pmap[parts], parts), collapse = " "),
+    character(1))
+}
+
+long <- long %>%
+  mutate(subgroup_label      = str_squish(str_to_lower(subgroup)),
+         subgroup_normalized = normalize_label(subgroup))
+
+cat(sprintf("\n%d articles -> %d label rows | %d unique labels raw, %d after plural normalization\n",
+            nrow(dat), nrow(long), n_distinct(long$subgroup_label),
+            n_distinct(long$subgroup_normalized)))
+
+# Stopword removal inside labels 
+custom_stopwords <- unique(str_squish(str_to_lower(custom_stopwords)))
+custom_words     <- custom_stopwords[!str_detect(custom_stopwords, " ")]
+protected_phrases <- unique(str_squish(str_to_lower(protected_phrases)))
+
+stopword_set <- function(variant) {
+  switch(variant,
+         none    = character(0),
+         english = setdiff(english_stopwords, keep_words),
+         custom  = union(setdiff(english_stopwords, keep_words), custom_words),
+         stop("unknown variant: ", variant))
+}
+
+reduce_phrase <- function(s, label_stopwords) {
+  if (!length(label_stopwords)) return(s)
+  vapply(s, function(x) {
+    if (x %in% protected_phrases) return(x)
+    parts <- str_split(x, " ")[[1]]
+    kept  <- setdiff(parts, label_stopwords)
+    if (length(kept)) return(paste(kept, collapse = " "))
+    switch(on_all_stopwords,
+           keep = x,
+           drop = NA_character_,
+           head = {
+             for (sw in custom_stopwords) {
+               if (length(parts) <= 1) break
+               parts <- parts[parts != sw]
+             }
+             paste(parts, collapse = " ")
+           },
+           stop("on_all_stopwords must be \"drop\", \"keep\" or \"head\""))
+  }, character(1), USE.NAMES = FALSE)
+}
+
+# Count per EPP, take the top 5
+run_variant <- function(variant) {
+
+  sw <- stopword_set(variant)
+
+  ph <- long %>%
+    mutate(phrase = reduce_phrase(subgroup_normalized, sw)) %>%
+    filter(!is.na(phrase), nzchar(phrase))
+
+  dropped <- long %>%
+    mutate(phrase = reduce_phrase(subgroup_normalized, sw)) %>%
+    filter(is.na(phrase)) %>%
+    count(EPP, name = "label_rows_dropped")
+
+  freq <- ph %>%
+    count(EPP, phrase, name = "n") %>%
+    group_by(EPP) %>%
+    mutate(label_rows   = sum(n),
+           pct          = 100 * n / label_rows,
+           phrase_ngram = str_count(phrase, "\\S+")) %>%
+    arrange(EPP, desc(n), phrase) %>%
+    ungroup() %>%
+    mutate(variant = variant)
+
+  # Which normalized labels fed each phrase 
+  merged <- ph %>%
+    count(EPP, phrase, subgroup_normalized, sort = TRUE) %>%
+    group_by(EPP, phrase) %>%
+    summarise(labels_merged = paste0(subgroup_normalized, " (", n, ")", collapse = ", "),
+              n_labels_merged = n(), .groups = "drop")
+
+  top <- freq %>%
+    group_by(EPP) %>%
+    slice_max(order_by = n, n = top_n, with_ties = FALSE) %>%
+    mutate(rank = row_number(), cum_pct = cumsum(pct)) %>%
+    ungroup() %>%
+    left_join(merged, by = c("EPP", "phrase")) %>%
+    select(variant, EPP, rank, phrase, phrase_ngram, n, label_rows, pct, cum_pct,
+           n_labels_merged, labels_merged)
+
+  cover <- top %>%
+    group_by(variant, EPP) %>%
+    summarise(top_n_count  = sum(n),
+              label_rows   = first(label_rows),
+              pct_covered  = round(100 * sum(n) / first(label_rows), 2),
+              .groups = "drop") %>%
+    left_join(dropped, by = "EPP") %>%
+    mutate(label_rows_dropped = replace_na(label_rows_dropped, 0L))
+
+  top %>%
+    mutate(across(c(pct, cum_pct), ~ round(.x, 2))) %>%
+    select(EPP, rank, phrase, n, label_rows, pct, cum_pct) %>%
+    as.data.frame() %>% print(row.names = FALSE)
+
+  write_csv(top,  file.path(outdir, paste0("top", top_n, "_by_epp_", variant, ".csv")))
+  write_csv(freq, file.path(outdir, paste0("all_phrases_by_epp_", variant, ".csv")))
+
+  list(top = top, freq = freq, cover = cover)
+}
+
+res <- lapply(setNames(variants, variants), run_variant)
+
+# One tidy file with every variant stacked 
+all_top <- bind_rows(lapply(res, `[[`, "top"))
+write_csv(all_top, file.path(outdir, paste0("top", top_n, "_by_epp_all_variants.csv")))
+
+# Plural-map audit 
+cnt_raw  <- table(words_of(long$subgroup))
+n_raw_of <- function(w) as.integer(ifelse(w %in% names(cnt_raw), cnt_raw[w], 0))
+plural_tbl <- tibble(plural = names(pmap), singular = unname(pmap)) %>%
+  mutate(n_plural = n_raw_of(plural), n_singular = n_raw_of(singular),
+         flag = if_else(n_singular < 0.05 * n_plural,
+                        "CHECK: stem far rarer than plural - possible non-word", "")) %>%
+  arrange(desc(n_plural))
+write_csv(plural_tbl, file.path(outdir, "plural_map.csv"))
+susp <- plural_tbl[nzchar(plural_tbl$flag), ]
+if (nrow(susp))
+  message(sprintf("Plural map: %d mapping(s) worth checking - %s",
+                  nrow(susp), paste0(susp$plural, " -> ", susp$singular, collapse = ", ")))
